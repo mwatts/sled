@@ -205,8 +205,6 @@ pub struct Inner {
     #[doc(hidden)]
     pub compression_factor: i32,
     #[doc(hidden)]
-    pub print_profile_on_drop: bool,
-    #[doc(hidden)]
     pub idgen_persist_interval: u64,
     #[doc(hidden)]
     pub snapshot_after_ops: u64,
@@ -235,7 +233,6 @@ impl Default for Inner {
 
             // useful in testing
             segment_size: 512 * 1024, // 512kb in bytes
-            print_profile_on_drop: false,
             flush_every_ms: Some(500),
             idgen_persist_interval: 1_000_000,
             snapshot_after_ops: if cfg!(feature = "testing") {
@@ -365,33 +362,6 @@ impl Config {
     }
 
     #[doc(hidden)]
-    #[deprecated(
-        since = "0.31.0",
-        note = "this does nothing for now. maybe it will come back in the future."
-    )]
-    pub const fn segment_cleanup_skew(self, _: usize) -> Self {
-        self
-    }
-
-    #[doc(hidden)]
-    #[deprecated(
-        since = "0.31.0",
-        note = "this does nothing for now. maybe it will come back in the future."
-    )]
-    pub const fn segment_cleanup_threshold(self, _: u8) -> Self {
-        self
-    }
-
-    #[doc(hidden)]
-    #[deprecated(
-        since = "0.31.0",
-        note = "this does nothing for now. maybe it will come back in the future."
-    )]
-    pub fn snapshot_path<P>(self, _: P) -> Self {
-        self
-    }
-
-    #[doc(hidden)]
     pub fn flush_every_ms(mut self, every_ms: Option<u64>) -> Self {
         if Arc::strong_count(&self.0) != 1 {
             error!(
@@ -487,11 +457,6 @@ impl Config {
             create_new,
             bool,
             "attempts to exclusively open the database, failing if it already exists"
-        ),
-        (
-            print_profile_on_drop,
-            bool,
-            "print a performance profile when the Config is dropped"
         ),
         (
             snapshot_after_ops,
@@ -793,11 +758,6 @@ impl Deref for RunningConfig {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.print_profile_on_drop {
-            #[cfg(feature = "metrics")]
-            M.print_profile();
-        }
-
         if !self.temporary {
             return;
         }

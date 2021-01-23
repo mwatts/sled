@@ -32,33 +32,66 @@
 
 # sled - ~~it's all downhill from here!!!~~
 
-A lightweight pure-rust high-performance transactional embedded database.
+An embedded database.
 
 ```rust
-let tree = sled::open("/tmp/welcome-to-sled").expect("open");
+let tree = sled::open("/tmp/welcome-to-sled")?;
 
 // insert and get, similar to std's BTreeMap
-tree.insert("KEY1", "VAL1");
-assert_eq!(tree.get(&"KEY1"), Ok(Some(sled::IVec::from("VAL1"))));
+let old_value = tree.insert("key", "value")?;
+
+assert_eq!(
+  tree.get(&"key")?,
+  Some(sled::IVec::from("value")),
+);
 
 // range queries
-for kv in tree.range("KEY1".."KEY9") {}
+for kv_result in tree.range("key_1".."key_9") {}
 
 // deletion
-tree.remove(&"KEY1");
+let old_value = tree.remove(&"key")?;
 
 // atomic compare and swap
-tree.compare_and_swap("KEY1", Some("VAL1"), Some("VAL2"));
+tree.compare_and_swap(
+  "key",
+  Some("current_value"),
+  Some("new_value"),
+)?;
 
 // block until all operations are stable on disk
 // (flush_async also available to get a Future)
-tree.flush();
+tree.flush()?;
 ```
 
 If you would like to work with structured data without paying expensive deserialization costs, check out the [structured](examples/structured.rs) example!
 
+# features
+
+* [API](https://docs.rs/sled) similar to a threadsafe `BTreeMap<[u8], [u8]>`
+* serializable (ACID) [transactions](https://docs.rs/sled/latest/sled/struct.Tree.html#method.transaction)
+  for atomically reading and writing to multiple keys in multiple keyspaces.
+* fully atomic single-key operations, including [compare and swap](https://docs.rs/sled/latest/sled/struct.Tree.html#method.compare_and_swap)
+* zero-copy reads
+* [write batches](https://docs.rs/sled/latest/sled/struct.Tree.html#method.apply_batch)
+* [subscribe to changes on key
+  prefixes](https://docs.rs/sled/latest/sled/struct.Tree.html#method.watch_prefix)
+* [multiple keyspaces](https://docs.rs/sled/latest/sled/struct.Db.html#method.open_tree)
+* [merge operators](https://docs.rs/sled/latest/sled/doc/merge_operators/index.html)
+* forward and reverse iterators over ranges of items
+* a crash-safe monotonic [ID generator](https://docs.rs/sled/latest/sled/struct.Db.html#method.generate_id)
+  capable of generating 75-125 million unique ID's per second
+* [zstd](https://github.com/facebook/zstd) compression (use the
+  `compression` build feature, disabled by default)
+* cpu-scalable lock-free implementation
+* flash-optimized log-structured storage
+* uses modern b-tree techniques such as prefix encoding and suffix
+  truncation for reducing the storage costs of long keys with shared
+  prefixes
+
 # expectations, gotchas, advice
 
+* Maybe one of the first things that seems weird is the `IVec` type.
+  This is an inlinable `Arc`ed slice that makes some things more efficient.
 * Durability: **sled automatically fsyncs every 500ms by default**,
   which can be configured with the `flush_every_ms` configurable, or you may
   call `flush` / `flush_async` manually after operations.
@@ -76,7 +109,9 @@ If you would like to work with structured data without paying expensive deserial
 * sled does not support multiple open instances for the time being. Please
   keep sled open for the duration of your process's lifespan. It's totally
   safe and often quite convenient to use a global lazy_static sled instance,
-  modulo the normal global variable trade-offs.
+  modulo the normal global variable trade-offs. Every operation is threadsafe,
+  and most are implemented under the hood with lock-free algorithms that avoid
+  blocking in hot paths.
 
 # performance
 
@@ -84,32 +119,6 @@ If you would like to work with structured data without paying expensive deserial
   with [traditional B+ tree](https://en.wikipedia.org/wiki/B%2B_tree)-like read performance
 * over a billion operations in under a minute at 95% read 5% writes on 16 cores on a small dataset
 * measure your own workloads rather than relying on some marketing for contrived workloads
-
-what's the trade-off? sled uses too much disk space sometimes. this will improve significantly before 1.0.
-
-# features
-
-* [API](https://docs.rs/sled) similar to a threadsafe `BTreeMap<[u8], [u8]>`
-* serializable (ACID) [transactions](https://docs.rs/sled/latest/sled/struct.Tree.html#method.transaction)
-  for atomically reading and writing to multiple keys in multiple keyspaces.
-* fully atomic single-key operations, including [compare and swap](https://docs.rs/sled/latest/sled/struct.Tree.html#method.compare_and_swap)
-* zero-copy reads
-* [write batches](https://docs.rs/sled/latest/sled/struct.Tree.html#method.apply_batch)
-* [subscribe to changes on key
-  prefixes](struct.Tree.html#method.watch_prefix)
-* [multiple keyspaces](https://docs.rs/sled/latest/sled/struct.Db.html#method.open_tree)
-* [merge operators](https://docs.rs/sled/latest/sled/doc/merge_operators/index.html)
-* forward and reverse iterators over ranges of items
-* a crash-safe monotonic [ID generator](https://docs.rs/sled/latest/sled/struct.Db.html#method.generate_id)
-  capable of generating 75-125 million unique ID's per second
-* [zstd](https://github.com/facebook/zstd) compression (use the
-  `compression` build feature, disabled by default)
-* cpu-scalable lock-free implementation
-* flash-optimized log-structured storage
-* uses modern b-tree techniques such as prefix encoding and suffix
-  truncation for reducing the storage costs of long keys with shared
-  prefixes
-
 
 # a note on lexicographic ordering and endianness
 

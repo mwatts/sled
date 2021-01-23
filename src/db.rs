@@ -2,6 +2,8 @@ use std::ops::Deref;
 
 use crate::*;
 
+const DEFAULT_TREE_ID: &[u8] = b"__sled__default";
+
 /// The `sled` embedded database! Implements
 /// `Deref<Target = sled::Tree>` to refer to
 /// a default keyspace / namespace / bucket.
@@ -11,18 +13,6 @@ pub struct Db {
     pub context: Context,
     pub(crate) default: Tree,
     tenants: Arc<RwLock<FastMap8<IVec, Tree>>>,
-}
-
-/// Opens a `Db` with a default configuration at the
-/// specified path. This will create a new storage
-/// directory at the specified path if it does
-/// not already exist. You can use the `Db::was_recovered`
-/// method to determine if your database was recovered
-/// from a previous instance. You can use `Config::create_new`
-/// if you want to increase the chances that the database
-/// will be freshly created.
-pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Db> {
-    Config::new().path(path).open()
 }
 
 impl Deref for Db {
@@ -52,12 +42,6 @@ impl Debug for Db {
 }
 
 impl Db {
-    #[doc(hidden)]
-    #[deprecated(since = "0.30.2", note = "replaced by `sled::open`")]
-    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        Config::new().path(path).open()
-    }
-
     pub(crate) fn start_inner(config: RunningConfig) -> Result<Self> {
         #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.tree_start);
@@ -74,6 +58,7 @@ impl Db {
                 target_os = "freebsd",
                 target_os = "openbsd",
                 target_os = "netbsd",
+                target_os = "ios",
             )
         ))]
         {
@@ -187,7 +172,7 @@ impl Db {
         let mut cursor = root_id.unwrap();
         while let Some(view) = self.view_for_pid(cursor, &guard)? {
             if view.is_index {
-                let leftmost_child = view.index_pid(0);
+                let leftmost_child = view.iter_index_pids().next().unwrap();
                 leftmost_chain.push(leftmost_child);
                 cursor = leftmost_child;
             } else {
@@ -284,11 +269,11 @@ impl Db {
     /// ```
     /// # use sled as old_sled;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let old = old_sled::open("my_old_db")?;
+    /// let old = old_sled::open("my_old__db")?;
     ///
     /// // may be a different version of sled,
     /// // the export type is version agnostic.
-    /// let new = sled::open("my_new_db")?;
+    /// let new = sled::open("my_new__db")?;
     ///
     /// let export = old.export();
     /// new.import(export);
@@ -296,8 +281,8 @@ impl Db {
     /// assert_eq!(old.checksum()?, new.checksum()?);
     /// # drop(old);
     /// # drop(new);
-    /// # std::fs::remove_file("my_old_db");
-    /// # std::fs::remove_file("my_new_db");
+    /// # std::fs::remove_file("my_old__db");
+    /// # std::fs::remove_file("my_new__db");
     /// # Ok(()) }
     /// ```
     pub fn export(

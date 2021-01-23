@@ -1,11 +1,11 @@
-//! `sled` is a high-performance embedded database with
+//! `sled` is an embedded database with
 //! an API that is similar to a `BTreeMap<[u8], [u8]>`,
 //! but with several additional capabilities for
 //! assisting creators of stateful systems.
 //!
 //! It is fully thread-safe, and all operations are
-//! atomic. Multiple `Tree`s with isolated keyspaces
-//! are supported with the
+//! atomic. Most are fully non-blocking. Multiple
+//! `Tree`s with isolated keyspaces are supported with the
 //! [`Db::open_tree`](struct.Db.html#method.open_tree) method.
 //!
 //! ACID transactions involving reads and writes to
@@ -178,16 +178,19 @@ macro_rules! testing_assert {
     };
 }
 
-mod arc;
 mod atomic_shim;
+mod backoff;
 mod batch;
+mod cache_padded;
 mod concurrency_control;
 mod config;
 mod context;
 mod db;
 mod dll;
+mod ebr;
 mod fastcmp;
 mod fastlock;
+mod fnv;
 mod histogram;
 mod iter;
 mod ivec;
@@ -204,6 +207,7 @@ mod serialization;
 mod stack;
 mod subscriber;
 mod sys_limits;
+mod threadpool;
 pub mod transaction;
 mod tree;
 mod varint;
@@ -215,33 +219,6 @@ pub mod fail;
 #[cfg(feature = "docs")]
 pub mod doc;
 
-#[cfg(any(
-    miri,
-    not(any(
-        windows,
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-    ))
-))]
-mod threadpool {
-    use super::{OneShot, Result};
-
-    /// Just execute a task without involving threads.
-    pub fn spawn<F, R>(work: F) -> Result<OneShot<R>>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let (promise_filler, promise) = OneShot::pair();
-        promise_filler.fill((work)());
-        Ok(promise)
-    }
-}
-
 #[cfg(all(
     not(miri),
     any(
@@ -252,20 +229,7 @@ mod threadpool {
         target_os = "freebsd",
         target_os = "openbsd",
         target_os = "netbsd",
-    )
-))]
-mod threadpool;
-
-#[cfg(all(
-    not(miri),
-    any(
-        windows,
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
+        target_os = "ios",
     )
 ))]
 mod flusher;
@@ -282,32 +246,53 @@ mod measure_allocs;
 static ALLOCATOR: measure_allocs::TrackingAllocator =
     measure_allocs::TrackingAllocator;
 
-const DEFAULT_TREE_ID: &[u8] = b"__sled__default";
+/// Opens a `Db` with a default configuration at the
+/// specified path. This will create a new storage
+/// directory at the specified path if it does
+/// not already exist. You can use the `Db::was_recovered`
+/// method to determine if your database was recovered
+/// from a previous instance. You can use `Config::create_new`
+/// if you want to increase the chances that the database
+/// will be freshly created.
+pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Db> {
+    Config::new().path(path).open()
+}
+
+/// Print a performance profile to standard out
+/// detailing what the internals of the system are doing.
+///
+/// Requires the `metrics` feature to be enabled,
+/// which may introduce a bit of memory and overall
+/// performance overhead as lots of metrics are
+/// tallied up. Nevertheless, it is a useful
+/// tool for quickly understanding the root of
+/// a performance problem, and it can be invaluable
+/// for including in any opened issues.
+#[cfg(feature = "metrics")]
+#[allow(clippy::print_stdout)]
+pub fn print_profile() {
+    println!("{}", M.format_profile());
+}
 
 /// hidden re-export of items for testing purposes
 #[doc(hidden)]
-pub use {
-    self::{
-        config::RunningConfig,
-        lazy::Lazy,
-        pagecache::{
-            constants::{
-                MAX_MSG_HEADER_LEN, MAX_SPACE_AMPLIFICATION, SEG_HEADER_LEN,
-            },
-            BatchManifest, DiskPtr, Log, LogKind, LogOffset, LogRead, Lsn,
-            PageCache, PageId,
+pub use self::{
+    config::RunningConfig,
+    lazy::Lazy,
+    pagecache::{
+        constants::{
+            MAX_MSG_HEADER_LEN, MAX_SPACE_AMPLIFICATION, SEG_HEADER_LEN,
         },
-        serialization::Serialize,
+        BatchManifest, DiskPtr, Log, LogKind, LogOffset, LogRead, Lsn,
+        PageCache, PageId,
     },
-    crossbeam_epoch::{
-        pin as crossbeam_pin, Atomic, Guard as CrossbeamGuard, Owned, Shared,
-    },
+    serialization::Serialize,
 };
 
 pub use self::{
     batch::Batch,
     config::{Config, Mode},
-    db::{open, Db},
+    db::Db,
     iter::Iter,
     ivec::IVec,
     result::{Error, Result},
@@ -324,10 +309,15 @@ use self::{
 
 use {
     self::{
-        arc::Arc,
         atomic_shim::{AtomicI64 as AtomicLsn, AtomicU64},
+        backoff::Backoff,
+        cache_padded::CachePadded,
         concurrency_control::Protector,
         context::Context,
+        ebr::{
+            pin as crossbeam_pin, Atomic, Guard as CrossbeamGuard, Owned,
+            Shared,
+        },
         fastcmp::fastcmp,
         lru::Lru,
         meta::Meta,
@@ -337,32 +327,32 @@ use {
         subscriber::Subscribers,
         tree::TreeInner,
     },
-    crossbeam_utils::{Backoff, CachePadded},
     log::{debug, error, trace, warn},
-    pagecache::RecoveryGuard,
+    pagecache::{constants::MAX_BLOB, RecoveryGuard},
     parking_lot::{Condvar, Mutex, RwLock},
     std::{
         collections::BTreeMap,
         convert::TryFrom,
         fmt::{self, Debug},
         io::{Read, Write},
-        sync::atomic::{
-            AtomicUsize,
-            Ordering::{Acquire, Release, SeqCst},
+        sync::{
+            atomic::{
+                AtomicUsize,
+                Ordering::{Acquire, Relaxed, Release, SeqCst},
+            },
+            Arc,
         },
     },
 };
 
 #[doc(hidden)]
 pub fn pin() -> Guard {
-    Guard { inner: crossbeam_pin(), readset: vec![], writeset: vec![] }
+    Guard { inner: crossbeam_pin() }
 }
 
 #[doc(hidden)]
 pub struct Guard {
     inner: CrossbeamGuard,
-    readset: Vec<PageId>,
-    writeset: Vec<PageId>,
 }
 
 impl std::ops::Deref for Guard {
@@ -415,10 +405,8 @@ const fn debug_delay() {}
 pub(crate) enum Link {
     /// A new value is set for a given key
     Set(IVec, IVec),
-    /// Replace an existing key with a new value
-    Replace(usize, IVec),
     /// The kv pair at a particular index is removed
-    Del(usize),
+    Del(IVec),
     /// A child of this Index node is marked as mergable
     ParentMergeIntention(PageId),
     /// The merging child has been completely merged into its left sibling
@@ -430,11 +418,8 @@ pub(crate) enum Link {
 /// A fast map that is not resistant to collision attacks. Works
 /// on 8 bytes at a time.
 #[cfg(not(feature = "testing"))]
-pub(crate) type FastMap8<K, V> = std::collections::HashMap<
-    K,
-    V,
-    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
->;
+pub(crate) type FastMap8<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<fnv::Hasher>>;
 
 #[cfg(feature = "testing")]
 pub(crate) type FastMap8<K, V> = BTreeMap<K, V>;
@@ -442,10 +427,8 @@ pub(crate) type FastMap8<K, V> = BTreeMap<K, V>;
 /// A fast set that is not resistant to collision attacks. Works
 /// on 8 bytes at a time.
 #[cfg(not(feature = "testing"))]
-pub(crate) type FastSet8<V> = std::collections::HashSet<
-    V,
-    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
->;
+pub(crate) type FastSet8<V> =
+    std::collections::HashSet<V, std::hash::BuildHasherDefault<fnv::Hasher>>;
 
 #[cfg(feature = "testing")]
 pub(crate) type FastSet8<V> = std::collections::BTreeSet<V>;

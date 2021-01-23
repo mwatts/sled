@@ -249,7 +249,7 @@ impl Log {
                 // has already been bumped by sealer.
                 trace_once!("io buffer already sealed, spinning");
 
-                backoff.snooze();
+                backoff.spin();
 
                 continue;
             }
@@ -300,7 +300,7 @@ impl Log {
             // recovery, we assume that nothing can begin here,
             // because headers are dynamically sized.
             let red_zone = iobuf.capacity - buf_offset < MAX_MSG_HEADER_LEN;
-            let would_overflow = prospective_size > iobuf.capacity || red_zone;
+            let would_overflow = red_zone || prospective_size > iobuf.capacity;
             if would_overflow {
                 // This buffer is too full to accept our write!
                 // Try to seal the buffer, and maybe write it if
@@ -325,7 +325,7 @@ impl Log {
                     "spinning because our buffer has {} writers already",
                     header::MAX_WRITERS
                 );
-                backoff.snooze();
+                backoff.spin();
                 continue;
             }
 
@@ -459,15 +459,7 @@ impl Log {
             );
             let iobufs = self.iobufs.clone();
             let iobuf = iobuf.clone();
-            threadpool::spawn(move || {
-                if let Err(e) = iobufs.write_to_log(&iobuf) {
-                    error!(
-                        "hit error while writing iobuf with lsn {}: {:?}",
-                        lsn, e
-                    );
-                    iobufs.config.set_global_error(e);
-                }
-            })?;
+            threadpool::write_to_log(iobuf, iobufs)?;
 
             Ok(())
         } else {
@@ -596,14 +588,14 @@ impl From<[u8; SEG_HEADER_LEN]> for SegmentHeader {
     }
 }
 
-impl Into<[u8; SEG_HEADER_LEN]> for SegmentHeader {
-    fn into(self) -> [u8; SEG_HEADER_LEN] {
+impl From<SegmentHeader> for [u8; SEG_HEADER_LEN] {
+    fn from(header: SegmentHeader) -> [u8; SEG_HEADER_LEN] {
         let mut buf = [0; SEG_HEADER_LEN];
 
-        let xor_lsn = self.lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
+        let xor_lsn = header.lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
         let lsn_arr = lsn_to_arr(xor_lsn);
 
-        let xor_max_stable_lsn = self.max_stable_lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
+        let xor_max_stable_lsn = header.max_stable_lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
         let highest_stable_lsn_arr = lsn_to_arr(xor_max_stable_lsn);
 
         #[allow(unsafe_code)]

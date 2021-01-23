@@ -6,25 +6,22 @@ use std::{
     thread,
 };
 
+#[cfg(feature = "jemalloc")]
+use jemallocator::Jemalloc;
+
+#[cfg(feature = "dh")]
+use dhat::{Dhat, DhatAlloc};
+
 use num_format::{Locale, ToFormattedString};
 use rand::{thread_rng, Rng};
 
-#[cfg_attr(
-    // only enable jemalloc on linux and macos by default
-    all(
-        any(target_os = "linux", target_os = "macos"),
-        feature = "jemalloc",
-    ),
-    global_allocator
-)]
-#[cfg(
-    // only enable jemalloc on linux and macos by default
-    all(
-        any(target_os = "linux", target_os = "macos"),
-        feature = "jemalloc",
-    ),
-)]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+#[global_allocator]
+#[cfg(feature = "jemalloc")]
+static ALLOCATOR: Jemalloc = Jemalloc;
+
+#[global_allocator]
+#[cfg(feature = "dh")]
+static ALLOCATOR: DhatAlloc = DhatAlloc;
 
 static TOTAL: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,6 +55,7 @@ Options:
     --sequential       Run the test in sequential mode instead of random.
     --total-ops=<n>    Stop test after executing a total number of operations.
     --flush-every=<m>  Flush and sync the database every ms [default: 200].
+    --cache-mb=<mb>    Size of the page cache in megabytes [default: 1024].
 ";
 
 #[derive(Clone, Copy)]
@@ -77,6 +75,7 @@ struct Args {
     sequential: bool,
     total_ops: Option<usize>,
     flush_every: u64,
+    cache_mb: usize,
 }
 
 impl Default for Args {
@@ -97,6 +96,7 @@ impl Default for Args {
             sequential: false,
             total_ops: None,
             flush_every: 200,
+            cache_mb: 1024,
         }
     }
 }
@@ -289,14 +289,20 @@ fn main() {
     #[cfg(feature = "logging")]
     setup_logger();
 
+    #[cfg(feature = "dh")]
+    let _dh = Dhat::start_heap_profiling();
+
     let args = Args::parse();
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let config = sled::Config::new()
-        .cache_capacity(256 * 1024 * 1024)
-        .flush_every_ms(Some(args.flush_every))
-        .print_profile_on_drop(true);
+        .cache_capacity(args.cache_mb as u64 * 1024 * 1024)
+        .flush_every_ms(if args.flush_every == 0 {
+            None
+        } else {
+            Some(args.flush_every)
+        });
 
     let tree = Arc::new(config.open().unwrap());
     tree.set_merge_operator(concatenate_merge);
@@ -346,6 +352,9 @@ fn main() {
         time,
         ((ops * 1_000) / (time * 1_000)).to_formatted_string(&Locale::en)
     );
+
+    #[cfg(feature = "metrics")]
+    sled::print_profile();
 }
 
 #[cfg(feature = "logging")]
