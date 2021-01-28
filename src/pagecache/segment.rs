@@ -275,15 +275,24 @@ impl Segment {
                 config.heap.free(*heap_id);
             }
 
+            let max_pids = active.pids.len();
+
+            let mut pids =
+                std::mem::replace(&mut active.pids, Default::default());
+
+            for deferred_replaced_pid in &active.deferred_replaced_pids {
+                assert!(pids.remove(deferred_replaced_pid));
+            }
+
             let inactive = Segment::Inactive(Inactive {
                 lsn: active.lsn,
                 rss: active
                     .rss
                     .checked_sub(active.deferred_replaced_rss)
                     .unwrap(),
-                max_pids: active.pids.len(),
+                max_pids,
                 replaced_pids: active.deferred_replaced_pids.len(),
-                pids: &active.pids - &active.deferred_replaced_pids,
+                pids,
                 latest_replacement_lsn: active.latest_replacement_lsn,
             });
 
@@ -1189,7 +1198,7 @@ impl SegmentAccountant {
         let config = self.config.clone();
 
         io_fail!(&config, "file truncation");
-        let promise = threadpool::truncate(config, at)?;
+        let promise = threadpool::truncate(config, at);
 
         if self.async_truncations.insert(at, promise).is_some() {
             panic!(

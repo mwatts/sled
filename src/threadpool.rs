@@ -20,13 +20,16 @@ use crate::{OneShot, Result};
 mod queue {
     use std::{
         collections::VecDeque,
-        sync::Once,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Once,
+        },
         time::{Duration, Instant},
     };
 
     use parking_lot::{Condvar, Mutex};
 
-    use crate::{debug_delay, Lazy, OneShot, Result};
+    use crate::{debug_delay, Lazy, OneShot};
 
     pub(super) static BLOCKING_QUEUE: Lazy<Queue, fn() -> Queue> =
         Lazy::new(Default::default);
@@ -39,10 +42,7 @@ mod queue {
 
     type Work = Box<dyn FnOnce() + Send + 'static>;
 
-    pub(super) fn spawn_to<F, R>(
-        work: F,
-        queue: &'static Queue,
-    ) -> Result<OneShot<R>>
+    pub(super) fn spawn_to<F, R>(work: F, queue: &'static Queue) -> OneShot<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static + Sized,
@@ -62,7 +62,7 @@ mod queue {
 
             std::thread::Builder::new()
                 .name("sled-snapshot-thread".into())
-                .spawn(|| SNAPSHOT_QUEUE.perform_work(false, false))
+                .spawn(|| SNAPSHOT_QUEUE.perform_work(true, false))
                 .expect("failed to spawn critical snapshot thread");
 
             std::thread::Builder::new()
@@ -78,13 +78,15 @@ mod queue {
 
         queue.send(Box::new(task));
 
-        Ok(promise)
+        promise
     }
 
     #[derive(Default)]
     pub(super) struct Queue {
         cv: Condvar,
         mu: Mutex<VecDeque<Work>>,
+        temporary_threads: AtomicUsize,
+        spawning: AtomicBool,
     }
 
     #[allow(unsafe_code)]
@@ -122,6 +124,10 @@ mod queue {
         }
 
         fn perform_work(&'static self, elastic: bool, temporary: bool) {
+            const MAX_TEMPORARY_THREADS: usize = 16;
+
+            self.spawning.store(false, Ordering::SeqCst);
+
             let wait_limit = Duration::from_millis(100);
 
             let mut unemployed_loops = 0;
@@ -136,7 +142,24 @@ mod queue {
 
                 if let Some((task, outstanding_work)) = task_opt {
                     // spin up some help if we're falling behind
-                    if elastic && outstanding_work > 5 {
+
+                    let temporary_threads =
+                        self.temporary_threads.load(Ordering::Acquire);
+
+                    if elastic
+                        && outstanding_work > 5
+                        && temporary_threads < MAX_TEMPORARY_THREADS
+                        && self
+                            .spawning
+                            .compare_exchange(
+                                false,
+                                true,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
+                            .is_ok()
+                    {
+                        self.temporary_threads.fetch_add(1, Ordering::SeqCst);
                         let spawn_res = std::thread::Builder::new()
                             .name("sled-temporary-thread".into())
                             .spawn(move || self.perform_work(false, true));
@@ -145,6 +168,8 @@ mod queue {
                                 "failed to spin-up temporary work thread: {:?}",
                                 e
                             );
+                            self.temporary_threads
+                                .fetch_sub(1, Ordering::SeqCst);
                         }
                     }
 
@@ -156,12 +181,15 @@ mod queue {
                     unemployed_loops += 1;
                 }
             }
+
+            assert!(temporary);
+            self.temporary_threads.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
 
 /// Spawn a function on the threadpool.
-pub fn spawn<F, R>(work: F) -> Result<OneShot<R>>
+pub fn spawn<F, R>(work: F) -> OneShot<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static + Sized,
@@ -186,7 +214,7 @@ mod queue {
     /// This is the polyfill that just executes things synchronously.
     use crate::{OneShot, Result};
 
-    pub(super) fn spawn_to<F, R>(work: F, _: &()) -> Result<OneShot<R>>
+    pub(super) fn spawn_to<F, R>(work: F, _: &()) -> OneShot<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
@@ -195,7 +223,7 @@ mod queue {
         // perform threaded work on. Just execute a task without involving threads.
         let (promise_filler, promise) = OneShot::pair();
         promise_filler.fill((work)());
-        Ok(promise)
+        promise
     }
 
     pub(super) const IO_QUEUE: () = ();
@@ -206,10 +234,7 @@ mod queue {
 
 use queue::spawn_to;
 
-pub fn truncate(
-    config: crate::RunningConfig,
-    at: u64,
-) -> Result<OneShot<Result<()>>> {
+pub fn truncate(config: crate::RunningConfig, at: u64) -> OneShot<Result<()>> {
     spawn_to(
         move || {
             log::debug!("truncating file to length {}", at);
@@ -223,9 +248,7 @@ pub fn truncate(
     )
 }
 
-pub fn take_fuzzy_snapshot(
-    pc: crate::pagecache::PageCache,
-) -> Result<OneShot<()>> {
+pub fn take_fuzzy_snapshot(pc: crate::pagecache::PageCache) -> OneShot<()> {
     spawn_to(
         move || {
             if let Err(e) = pc.take_fuzzy_snapshot() {
@@ -239,7 +262,7 @@ pub fn take_fuzzy_snapshot(
 pub(crate) fn write_to_log(
     iobuf: Arc<crate::pagecache::iobuf::IoBuf>,
     iobufs: Arc<crate::pagecache::iobuf::IoBufs>,
-) -> Result<OneShot<()>> {
+) -> OneShot<()> {
     spawn_to(
         move || {
             let lsn = iobuf.lsn;
