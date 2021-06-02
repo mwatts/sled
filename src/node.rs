@@ -4,6 +4,7 @@
 
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
+    cell::UnsafeCell,
     cmp::Ordering::{self, Equal, Greater, Less},
     convert::{TryFrom, TryInto},
     fmt,
@@ -13,9 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{
-    pagecache::constants::PAGE_CONSOLIDATION_THRESHOLD, varint, IVec, Link,
-};
+use crate::{varint, IVec, Link};
 
 const ALIGNMENT: usize = align_of::<Header>();
 
@@ -34,7 +33,8 @@ fn uninitialized_node(len: usize) -> Inner {
 
     unsafe {
         let ptr = alloc_zeroed(layout);
-        Inner { ptr, len }
+        let cell_ptr = fatten(ptr, len);
+        Inner { ptr: cell_ptr }
     }
 }
 
@@ -118,14 +118,14 @@ fn apply_computed_distance(mut buf: &mut [u8], mut distance: usize) {
 // dimension that must be numerically represented
 // in a way that preserves lexicographic ordering.
 fn shared_distance(base: &[u8], search: &[u8]) -> usize {
-    fn f1(base: &[u8], search: &[u8]) -> usize {
+    const fn f1(base: &[u8], search: &[u8]) -> usize {
         (search[search.len() - 1] - base[search.len() - 1]) as usize
     }
     fn f2(base: &[u8], search: &[u8]) -> usize {
         (u16::from_be_bytes(search.try_into().unwrap()) as usize)
             - (u16::from_be_bytes(base.try_into().unwrap()) as usize)
     }
-    fn f3(base: &[u8], search: &[u8]) -> usize {
+    const fn f3(base: &[u8], search: &[u8]) -> usize {
         (u32::from_be_bytes([0, search[0], search[1], search[2]]) as usize)
             - (u32::from_be_bytes([0, base[0], base[1], base[2]]) as usize)
     }
@@ -367,7 +367,7 @@ impl PartialEq<[u8]> for KeyRef<'_> {
 }
 
 struct Iter<'a> {
-    overlay: std::slice::Iter<'a, (IVec, Option<IVec>)>,
+    overlay: std::iter::Skip<im::ordmap::Iter<'a, IVec, Option<IVec>>>,
     node: &'a Inner,
     node_position: usize,
     node_back_position: usize,
@@ -549,8 +549,8 @@ pub struct Node {
     // the overlay accumulates new writes and tombstones
     // for deletions that have not yet been merged
     // into the inner backing node
-    pub(crate) overlay: Vec<(IVec, Option<IVec>)>,
-    inner: Arc<Inner>,
+    pub(crate) overlay: im::OrdMap<IVec, Option<IVec>>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 impl Clone for Node {
@@ -569,7 +569,7 @@ impl Deref for Node {
 impl Node {
     fn iter(&self) -> Iter<'_> {
         Iter {
-            overlay: self.overlay.iter(),
+            overlay: self.overlay.iter().skip(0),
             node: &self.inner,
             node_position: 0,
             next_a: None,
@@ -593,18 +593,24 @@ impl Node {
     }
 
     pub(crate) fn new_root(child_pid: u64) -> Node {
-        Node { overlay: vec![], inner: Arc::new(Inner::new_root(child_pid)) }
+        Node {
+            overlay: Default::default(),
+            inner: Arc::new(Inner::new_root(child_pid)),
+        }
     }
 
     pub(crate) fn new_hoisted_root(left: u64, at: &[u8], right: u64) -> Node {
         Node {
-            overlay: vec![],
+            overlay: Default::default(),
             inner: Arc::new(Inner::new_hoisted_root(left, at, right)),
         }
     }
 
     pub(crate) fn new_empty_leaf() -> Node {
-        Node { overlay: vec![], inner: Arc::new(Inner::new_empty_leaf()) }
+        Node {
+            overlay: Default::default(),
+            inner: Arc::new(Inner::new_empty_leaf()),
+        }
     }
 
     pub(crate) fn apply(&self, link: &Link) -> Node {
@@ -648,41 +654,23 @@ impl Node {
                 let mut ret = self.merge_overlay();
                 Arc::make_mut(&mut ret).merging_child =
                     Some(NonZeroU64::new(pid).unwrap());
-                Node { inner: ret, overlay: vec![] }
+                Node { inner: ret, overlay: Default::default() }
             }
             ChildMergeCap => {
                 let mut ret = self.merge_overlay();
                 Arc::make_mut(&mut ret).merging = true;
-                Node { inner: ret, overlay: vec![] }
+                Node { inner: ret, overlay: Default::default() }
             }
         }
     }
 
     fn insert(&self, key: &IVec, value: &IVec) -> Node {
-        let search = self.overlay.binary_search_by_key(&key, |(k, _)| k);
-        let overlay = match search {
-            Ok(idx) => {
-                let mut overlay = self.overlay.clone();
-                overlay[idx].1 = Some(value.clone());
-                overlay
-            }
-            Err(idx) => {
-                let mut overlay = Vec::with_capacity(self.overlay.len() + 1);
-                overlay.extend_from_slice(&self.overlay);
-                overlay.insert(idx, (key.clone(), Some(value.clone())));
-                overlay
-            }
-        };
+        let overlay = self.overlay.update(key.clone(), Some(value.clone()));
         Node { overlay, inner: self.inner.clone() }
     }
 
     fn remove(&self, key: &IVec) -> Node {
-        let mut overlay = self.overlay.clone();
-        let search = overlay.binary_search_by_key(&key, |(k, _)| k);
-        match search {
-            Ok(idx) => overlay[idx].1 = None,
-            Err(idx) => overlay.insert(idx, (key.clone(), None)),
-        }
+        let overlay = self.overlay.update(key.clone(), None);
         let ret = Node { overlay, inner: self.inner.clone() };
         log::trace!(
             "applying removal of key {:?} results in node {:?}",
@@ -703,8 +691,7 @@ impl Node {
                 return false;
             }
         }
-        self.overlay.binary_search_by_key(&key, |(k, _)| k).is_ok()
-            || self.inner.contains_key(self.prefix_encode(key))
+        self.overlay.contains_key(key) || self.inner.contains_key(key)
     }
 
     // Push the overlay into the backing node.
@@ -789,8 +776,7 @@ impl Node {
         ret.merging_child = self.merging_child;
         ret.probation_ops_remaining =
             self.probation_ops_remaining.saturating_sub(
-                u8::try_from(self.overlay.len().min(std::u8::MAX as usize))
-                    .unwrap(),
+                u8::try_from(self.overlay.len().min(u8::MAX as usize)).unwrap(),
             );
 
         log::trace!("merged node {:?} into {:?}", self, ret);
@@ -910,15 +896,8 @@ impl Node {
             return None;
         }
 
-        let mut overlay = self.overlay.clone();
-
         let value = Some(to.to_le_bytes().as_ref().into());
-
-        let search = overlay.binary_search_by_key(&encoded_sep, |(k, _)| k);
-        match search {
-            Ok(idx) => overlay[idx].1 = value,
-            Err(idx) => overlay.insert(idx, (encoded_sep.into(), value)),
-        }
+        let overlay = self.overlay.update(encoded_sep.into(), value);
 
         let new_inner =
             Node { overlay, inner: self.inner.clone() }.merge_overlay();
@@ -931,20 +910,10 @@ impl Node {
     pub(crate) fn node_kv_pair<'a>(
         &'a self,
         key: &'a [u8],
-    ) -> (IVec, Option<&'a [u8]>) {
-        assert!(key >= self.lo());
-        if let Some(hi) = self.hi() {
-            assert!(key < hi);
-        }
-
+    ) -> (IVec, Option<&[u8]>) {
         let encoded_key = self.prefix_encode(key);
-
-        let overlay_search =
-            self.overlay.binary_search_by_key(&encoded_key, |(k, _)| k);
-
-        if let Ok(idx) = overlay_search {
-            let v = self.overlay[idx].1.as_ref();
-            (encoded_key.into(), v.map(AsRef::as_ref))
+        if let Some(v) = self.overlay.get(encoded_key) {
+            (encoded_key.into(), v.as_ref().map(AsRef::as_ref))
         } else {
             // look for the key in our compacted inner node
             let search = self.find(encoded_key);
@@ -962,23 +931,13 @@ impl Node {
         bound: &Bound<IVec>,
     ) -> Option<(IVec, IVec)> {
         let (overlay, node_position) = match bound {
-            Bound::Unbounded => (self.overlay.iter(), 0),
+            Bound::Unbounded => (self.overlay.iter().skip(0), 0),
             Bound::Included(b) => {
-                let overlay_search =
-                    self.overlay.binary_search_by_key(&b, |(k, _)| k);
-                let overlay = match overlay_search {
-                    Ok(idx) => {
-                        if let (k, Some(v)) = &self.overlay[idx] {
-                            // short circuit return
-                            return Some((
-                                self.prefix_decode(KeyRef::Slice(k)),
-                                v.clone(),
-                            ));
-                        }
-                        self.overlay[idx + 1..].iter()
-                    }
-                    Err(idx) => self.overlay[idx..].iter(),
-                };
+                if let Some(Some(v)) = self.overlay.get(b) {
+                    // short circuit return
+                    return Some((b.clone(), v.clone()));
+                }
+                let overlay_search = self.overlay.range(b.clone()..).skip(0);
 
                 let inner_search = if &**b < self.lo() {
                     Err(0)
@@ -995,14 +954,13 @@ impl Node {
                     Err(idx) => idx,
                 };
 
-                (overlay, node_position)
+                (overlay_search, node_position)
             }
             Bound::Excluded(b) => {
-                let overlay_search =
-                    self.overlay.binary_search_by_key(&b, |(k, _)| k);
-                let overlay = match overlay_search {
-                    Ok(idx) => self.overlay[idx + 1..].iter(),
-                    Err(idx) => self.overlay[idx..].iter(),
+                let overlay_search = if self.overlay.contains_key(b) {
+                    self.overlay.range(b.clone()..).skip(1)
+                } else {
+                    self.overlay.range(b.clone()..).skip(0)
                 };
 
                 let inner_search = if &**b < self.lo() {
@@ -1015,7 +973,7 @@ impl Node {
                     Err(idx) => idx,
                 };
 
-                (overlay, node_position)
+                (overlay_search, node_position)
             }
         };
 
@@ -1046,23 +1004,9 @@ impl Node {
         bound: &Bound<IVec>,
     ) -> Option<(IVec, IVec)> {
         let (overlay, node_back_position) = match bound {
-            Bound::Unbounded => (self.overlay.iter(), self.children()),
+            Bound::Unbounded => (self.overlay.iter().skip(0), self.children()),
             Bound::Included(b) => {
-                let overlay_search =
-                    self.overlay.binary_search_by_key(&b, |(k, _)| k);
-                let overlay = match overlay_search {
-                    Ok(idx) => {
-                        if let (k, Some(v)) = &self.overlay[idx] {
-                            // short circuit return
-                            return Some((
-                                self.prefix_decode(KeyRef::Slice(k)),
-                                v.clone(),
-                            ));
-                        }
-                        self.overlay[..idx].iter()
-                    }
-                    Err(idx) => self.overlay[..idx].iter(),
-                };
+                let overlay = self.overlay.range(..=b.clone()).skip(0);
 
                 let inner_search = if &**b < self.lo() {
                     Err(0)
@@ -1082,13 +1026,7 @@ impl Node {
                 (overlay, node_back_position)
             }
             Bound::Excluded(b) => {
-                let overlay_search =
-                    self.overlay.binary_search_by_key(&b, |(k, _)| k);
-                #[allow(clippy::match_same_arms)]
-                let overlay = match overlay_search {
-                    Ok(idx) => self.overlay[..idx].iter(),
-                    Err(idx) => self.overlay[..idx].iter(),
-                };
+                let overlay = self.overlay.range(..b.clone()).skip(0);
 
                 let above_hi =
                     if let Some(hi) = self.hi() { &**b >= hi } else { false };
@@ -1156,64 +1094,39 @@ impl Node {
 
     pub(crate) fn should_split(&self) -> bool {
         log::trace!("seeing if we should split node {:?}", self);
-        let size_check = if cfg!(any(test, feature = "lock_free_delays")) {
+        let size_checks = if cfg!(any(test, feature = "lock_free_delays")) {
             self.iter().take(6).count() > 5
         } else {
-            /*
-            let threshold = match self.rewrite_generations {
-                0 => 24 * 1024,
-                1 => {
-                    64 * 1024
-                }
-                other => {
-                    128 * 1024
-                }
-            };
-            */
-            let threshold = 1024 - crate::MAX_MSG_HEADER_LEN;
-            self.probation_ops_remaining == 0
-                && self.len > threshold
-                && self.iter().take(2).count() == 2
+            let size_threshold = 1024 - crate::MAX_MSG_HEADER_LEN;
+            let child_threshold = 56 * 1024;
+
+            self.len() > size_threshold || self.children > child_threshold
         };
 
         let safety_checks = self.merging_child.is_none()
             && !self.merging
-            && self.children
-                < std::u32::MAX
-                    - u32::try_from(PAGE_CONSOLIDATION_THRESHOLD).unwrap();
+            && self.iter().take(2).count() == 2
+            && self.probation_ops_remaining == 0;
 
-        if size_check {
+        if size_checks {
             log::trace!(
                 "should_split: {} is index: {} children: {} size: {}",
-                safety_checks && size_check,
+                safety_checks && size_checks,
                 self.is_index,
                 self.children,
                 self.rss()
             );
         }
 
-        safety_checks && size_check
+        safety_checks && size_checks
     }
 
     pub(crate) fn should_merge(&self) -> bool {
         let size_check = if cfg!(any(test, feature = "lock_free_delays")) {
             self.iter().take(2).count() < 2
-        /*
-        } else if self.is_index {
-            self.len < 4 * 1024
-        */
         } else {
-            /*
-            let threshold = match self.rewrite_generations {
-                0 => 10 * 1024,
-                1 => 30 * 1024,
-                other => {
-                    64 * 1024
-                }
-            };
-            */
-            let threshold = 256 - crate::MAX_MSG_HEADER_LEN;
-            self.len < threshold
+            let size_threshold = 256 - crate::MAX_MSG_HEADER_LEN;
+            self.len() < size_threshold
         };
 
         let safety_checks = self.merging_child.is_none()
@@ -1227,8 +1140,18 @@ impl Node {
 /// An immutable sorted string table
 #[must_use]
 pub struct Inner {
-    ptr: *mut u8,
-    pub len: usize,
+    ptr: *mut UnsafeCell<[u8]>,
+}
+
+/// <https://users.rust-lang.org/t/construct-fat-pointer-to-struct/29198/9>
+#[allow(trivial_casts)]
+fn fatten(data: *mut u8, len: usize) -> *mut UnsafeCell<[u8]> {
+    // Requirements of slice::from_raw_parts.
+    assert!(!data.is_null());
+    assert!(isize::try_from(len).is_ok());
+
+    let slice = unsafe { core::slice::from_raw_parts(data as *const (), len) };
+    slice as *const [()] as *mut _
 }
 
 impl PartialEq<Inner> for Inner {
@@ -1248,22 +1171,22 @@ unsafe impl Send for Inner {}
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.len, ALIGNMENT).unwrap();
+        let layout = Layout::from_size_align(self.len(), ALIGNMENT).unwrap();
         unsafe {
-            dealloc(self.ptr, layout);
+            dealloc(self.ptr(), layout);
         }
     }
 }
 
 impl AsRef<[u8]> for Inner {
     fn as_ref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        self.buf()
     }
 }
 
 impl AsMut<[u8]> for Inner {
     fn as_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        self.buf_mut()
     }
 }
 
@@ -1321,6 +1244,26 @@ fn is_linear(a: &KeyRef<'_>, b: &KeyRef<'_>, stride: u16) -> bool {
 }
 
 impl Inner {
+    #[inline]
+    fn ptr(&self) -> *mut u8 {
+        unsafe { (*self.ptr).get() as *mut u8 }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.buf().len()
+    }
+
+    #[inline]
+    fn buf(&self) -> &[u8] {
+        unsafe { &*(*self.ptr).get() }
+    }
+
+    #[inline]
+    fn buf_mut(&mut self) -> &mut [u8] {
+        unsafe { &mut *(*self.ptr).get() }
+    }
+
     unsafe fn from_raw(buf: &[u8]) -> Inner {
         let mut ret = uninitialized_node(buf.len());
         ret.as_mut().copy_from_slice(buf);
@@ -1335,7 +1278,7 @@ impl Inner {
         next: Option<NonZeroU64>,
         items: &[(KeyRef<'_>, &[u8])],
     ) -> Inner {
-        assert!(items.len() <= std::u32::MAX as usize);
+        assert!(items.len() <= u32::MAX as usize);
 
         // determine if we need to use varints and offset
         // indirection tables, or if everything is equal
@@ -1368,13 +1311,11 @@ impl Inner {
             None
         };
 
-        let mut fixed_key_length = items.first().and_then(|(k, _)| {
-            if k.is_empty() {
-                None
-            } else {
-                Some(k.len())
-            }
-        });
+        let mut fixed_key_length = match items {
+            [(kr, _), ..] if !kr.is_empty() => Some(kr.len()),
+            _ => None,
+        };
+
         let mut fixed_value_length = items.first().map(|(_, v)| v.len());
 
         let mut dynamic_key_storage_size = 0;
@@ -1428,7 +1369,7 @@ impl Inner {
 
         let fixed_value_length = fixed_value_length
             .and_then(|fvl| {
-                if fvl < std::u16::MAX as usize {
+                if fvl < u16::MAX as usize {
                     // we add 1 to the fvl to
                     // represent Some(0) in
                     // less space.
@@ -1509,6 +1450,26 @@ impl Inner {
             assert!(fixed_value_length.is_some());
         }
 
+        let header = ret.header_mut();
+        header.fixed_key_length = fixed_key_length;
+        header.fixed_value_length = fixed_value_length;
+        header.lo_len = lo.len() as u64;
+        header.hi_len = hi.map(|hi| hi.len() as u64).unwrap_or(0);
+        header.fixed_key_stride = fixed_key_stride;
+        header.offset_bytes = offset_bytes;
+        header.children = tf!(items.len(), u32);
+        header.prefix_len = prefix_len;
+        header.version = 1;
+        header.next = next;
+        header.is_index = is_index;
+
+        /*
+        header.merging_child = None;
+        header.merging = false;
+        header.probation_ops_remaining = 0;
+        header.activity_sketch = 0;
+        header.rewrite_generations = 0;
+         * TODO use UnsafeCell to allow this to soundly work
         *ret.header_mut() = Header {
             rewrite_generations: 0,
             activity_sketch: 0,
@@ -1527,6 +1488,7 @@ impl Inner {
             next,
             is_index,
         };
+        */
 
         ret.lo_mut().copy_from_slice(lo);
 
@@ -1766,7 +1728,7 @@ impl Inner {
 
         let start = offsets_buf_start + (index * self.offset_bytes as usize);
 
-        let mask = std::usize::MAX
+        let mask = usize::MAX
             >> (8
                 * (tf!(size_of::<usize>(), u32)
                     - u32::from(self.offset_bytes)));
@@ -1785,13 +1747,14 @@ impl Inner {
         // function from 7-11% down to 0.5-2% in a monotonic insertion workload.
         #[allow(unsafe_code)]
         unsafe {
-            let ptr: *const u8 = self.ptr.add(start);
+            let ptr: *const u8 = self.ptr().add(start);
             std::ptr::copy_nonoverlapping(
                 ptr,
                 tmp.as_mut_ptr() as *mut u8,
                 len,
             );
-            tmp.assume_init() & mask
+            *tmp.as_mut_ptr() &= mask;
+            tmp.assume_init()
         }
     }
 
@@ -1955,12 +1918,12 @@ impl Inner {
         let test_jitter_left = rand::thread_rng().gen_range(0, 16);
 
         #[cfg(not(test))]
-        let test_jitter_left = std::u8::MAX as usize;
+        let test_jitter_left = u8::MAX as usize;
 
         let additional_left_prefix = self.lo()[self.prefix_len as usize..]
             .iter()
             .zip(split_key[self.prefix_len as usize..].iter())
-            .take((std::u8::MAX - self.prefix_len) as usize)
+            .take((u8::MAX - self.prefix_len) as usize)
             .take_while(|(a, b)| a == b)
             .count()
             .min(test_jitter_left);
@@ -1969,13 +1932,13 @@ impl Inner {
         let test_jitter_right = rand::thread_rng().gen_range(0, 16);
 
         #[cfg(not(test))]
-        let test_jitter_right = std::u8::MAX as usize;
+        let test_jitter_right = u8::MAX as usize;
 
         let additional_right_prefix = if let Some(hi) = self.hi() {
             split_key[self.prefix_len as usize..]
                 .iter()
                 .zip(hi[self.prefix_len as usize..].iter())
-                .take((std::u8::MAX - self.prefix_len) as usize)
+                .take((u8::MAX - self.prefix_len) as usize)
                 .take_while(|(a, b)| a == b)
                 .count()
                 .min(test_jitter_right)
@@ -2030,7 +1993,7 @@ impl Inner {
         left.rewrite_generations =
             if split_point == 1 { 0 } else { self.rewrite_generations };
         left.probation_ops_remaining =
-            tf!((self.children() / 2).min(std::u8::MAX as usize), u8);
+            tf!((self.children() / 2).min(u8::MAX as usize), u8);
 
         let mut right = Inner::new(
             &split_key,
@@ -2116,12 +2079,12 @@ impl Inner {
             let test_jitter = rand::thread_rng().gen_range(0, 16);
 
             #[cfg(not(test))]
-            let test_jitter = std::u8::MAX as usize;
+            let test_jitter = u8::MAX as usize;
 
             self.lo()
                 .iter()
                 .zip(right_hi)
-                .take(std::u8::MAX as usize)
+                .take(u8::MAX as usize)
                 .take_while(|(a, b)| a == b)
                 .count()
                 .min(test_jitter)
@@ -2184,7 +2147,7 @@ impl Inner {
     }
 
     fn header(&self) -> &Header {
-        assert_eq!(self.ptr as usize % 8, 0);
+        assert_eq!(self.ptr() as usize % 8, 0);
         unsafe { &*(self.ptr as *mut u64 as *mut Header) }
     }
 
@@ -2197,7 +2160,7 @@ impl Inner {
     }
 
     pub(crate) fn rss(&self) -> u64 {
-        self.len as u64
+        self.len() as u64
     }
 
     fn children(&self) -> usize {
@@ -2514,7 +2477,7 @@ impl Inner {
 mod prefix {
     use crate::IVec;
 
-    pub(super) fn empty() -> &'static [u8] {
+    pub(super) const fn empty() -> &'static [u8] {
         &[]
     }
 

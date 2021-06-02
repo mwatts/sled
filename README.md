@@ -23,7 +23,7 @@
   </td>
   <td>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/spacejam/sled/master/art/tree_face_anti-transphobia.png" width="40%" height="auto" />
+  <img src="https://raw.githubusercontent.com/spacejam/sled/main/art/tree_face_anti-transphobia.png" width="40%" height="auto" />
   </p>
   </td>
  </tr>
@@ -161,7 +161,7 @@ extreme::run(async move {
 
 # minimum supported Rust version (MSRV)
 
-We support Rust 1.39.0 and up.
+We support Rust 1.48.0 and up.
 
 # architecture
 
@@ -183,6 +183,7 @@ for a more detailed overview of where we're at and where we see things going!
 
 * if reliability is your primary constraint, use SQLite. sled is beta.
 * if storage price performance is your primary constraint, use RocksDB. sled uses too much space sometimes.
+* if you have a multi-process workload that rarely writes, use LMDB. sled is architected for use with long-running, highly-concurrent workloads such as stateful services or higher-level databases.
 * quite young, should be considered unstable for the time being.
 * the on-disk format is going to change in ways that require [manual migrations](https://docs.rs/sled/latest/sled/struct.Db.html#method.export) before the `1.0.0` release!
 

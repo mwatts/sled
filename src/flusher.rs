@@ -13,12 +13,12 @@ pub(crate) enum ShutdownState {
 }
 
 impl ShutdownState {
-    fn is_running(self) -> bool {
-        if let ShutdownState::Running = self { true } else { false }
+    const fn is_running(self) -> bool {
+        matches!(self, ShutdownState::Running)
     }
 
-    fn is_shutdown(self) -> bool {
-        if let ShutdownState::ShutDown = self { true } else { false }
+    const fn is_shutdown(self) -> bool {
+        matches!(self, ShutdownState::ShutDown)
     }
 }
 
@@ -84,8 +84,7 @@ fn run(
             Err(e) => {
                 error!("failed to flush from periodic flush thread: {}", e);
 
-                #[cfg(feature = "failpoints")]
-                pagecache.set_failpoint(e);
+                pagecache.log.iobufs.set_global_error(e);
 
                 *shutdown = ShutdownState::ShutDown;
 
@@ -114,8 +113,7 @@ fn run(
                         e
                     );
 
-                    #[cfg(feature = "failpoints")]
-                    pagecache.set_failpoint(e);
+                    pagecache.log.iobufs.set_global_error(e);
 
                     *shutdown = ShutdownState::ShutDown;
 
@@ -173,7 +171,7 @@ impl Drop for Flusher {
             let _ = self.sc.wait_for(&mut shutdown, Duration::from_millis(100));
             count += 1;
 
-            testing_assert!(count < 5);
+            testing_assert!(count < 15);
         }
 
         let mut join_handle_opt = self.join_handle.lock();

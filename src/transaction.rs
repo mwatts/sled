@@ -354,10 +354,7 @@ impl TransactionalTree {
     }
 
     fn commit(&self, event: Event) -> Result<()> {
-        let writes = std::mem::replace(
-            &mut *self.writes.borrow_mut(),
-            Default::default(),
-        );
+        let writes = std::mem::take(&mut *self.writes.borrow_mut());
         let mut guard = pin();
         self.tree.apply_batch_inner(writes, Some(event), &mut guard)
     }
@@ -436,7 +433,7 @@ impl TransactionalTrees {
 }
 
 /// A simple constructor for `Err(TransactionError::Abort(_))`
-pub fn abort<A, T>(t: T) -> ConflictableTransactionResult<A, T> {
+pub const fn abort<A, T>(t: T) -> ConflictableTransactionResult<A, T> {
     Err(ConflictableTransactionError::Abort(t))
 }
 

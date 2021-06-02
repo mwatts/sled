@@ -538,16 +538,17 @@ impl Config {
         {
             use fs2::FileExt;
 
-            let try_lock = if cfg!(feature = "testing") {
-                // we block here because during testing
-                // there are many filesystem race condition
-                // that happen, causing locks to be held
-                // for long periods of time, so we should
-                // block to wait on reopening files.
-                file.lock_exclusive()
-            } else {
-                file.try_lock_exclusive()
-            };
+            let try_lock =
+                if cfg!(any(feature = "testing", feature = "light_testing")) {
+                    // we block here because during testing
+                    // there are many filesystem race condition
+                    // that happen, causing locks to be held
+                    // for long periods of time, so we should
+                    // block to wait on reopening files.
+                    file.lock_exclusive()
+                } else {
+                    file.try_lock_exclusive()
+                };
 
             if let Err(e) = try_lock {
                 return Err(Error::Io(io::Error::new(
@@ -757,15 +758,23 @@ impl Deref for RunningConfig {
     }
 }
 
+#[cfg(all(not(miri), any(windows, target_os = "linux", target_os = "macos")))]
+impl Drop for RunningConfig {
+    fn drop(&mut self) {
+        use fs2::FileExt;
+        if Arc::strong_count(&self.file) == 1 {
+            let _ = self.file.unlock();
+        }
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
-        if !self.temporary {
-            return;
+        if self.temporary {
+            // Our files are temporary, so nuke them.
+            debug!("removing temporary storage file {:?}", self.get_path());
+            let _res = fs::remove_dir_all(&self.get_path());
         }
-
-        // Our files are temporary, so nuke them.
-        debug!("removing temporary storage file {:?}", self.get_path());
-        let _res = fs::remove_dir_all(&self.get_path());
     }
 }
 

@@ -650,7 +650,7 @@ fn concurrent_tree_transactions() -> TransactionResult<()> {
         let barrier = barrier.clone();
         let thread = std::thread::spawn(move || {
             barrier.wait();
-            let sub = db.watch_prefix(b"k1");
+            let mut sub = db.watch_prefix(b"k1");
             drop(db);
 
             while sub.next_timeout(Duration::from_millis(100)).is_ok() {}
@@ -1057,6 +1057,23 @@ fn create_tree() {
 }
 
 #[test]
+fn contains_tree() {
+    let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+    let tree_one = db.open_tree("tree 1").unwrap();
+    let tree_two = db.open_tree("tree 2").unwrap();
+
+    drop(tree_one);
+    drop(tree_two);
+
+    assert_eq!(false, db.contains_tree("tree 3"));
+    assert_eq!(true, db.contains_tree("tree 1"));
+    assert_eq!(true, db.contains_tree("tree 2"));
+
+    assert!(db.drop_tree("tree 1").unwrap());
+    assert_eq!(false, db.contains_tree("tree 1"));
+}
+
+#[test]
 #[cfg_attr(miri, ignore)]
 fn tree_import_export() -> Result<()> {
     common::setup_logger();
@@ -1354,10 +1371,14 @@ fn tree_bug_08() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn tree_bug_09() {
-    // postmortem: was failing to load existing snapshots on initialization.
+    // postmortem 1: was failing to load existing snapshots on initialization.
     // would encounter uninitialized segments at the log tip and overwrite
     // the first segment (indexed by LSN of 0) in the segment accountant
     // ordering, skipping over important updates.
+    //
+    // postmortem 2: page size tracking was inconsistent in SA. completely
+    // removed exact size tracking, and went back to simpler pure-page
+    // tenancy model.
     prop_tree_matches_btreemap(
         vec![
             Set(Key(vec![189]), 36),

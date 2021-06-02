@@ -226,7 +226,7 @@ impl From<u64> for CacheAccess {
         let sz = usize::try_from((u << 56) >> 56).unwrap();
         assert_ne!(sz, 0);
         let pid = u >> 8;
-        assert!(pid < u64::from(std::u32::MAX));
+        assert!(pid < u64::from(u32::MAX));
         CacheAccess {
             pid: u32::try_from(pid).unwrap(),
             sz: u8::try_from(sz).unwrap(),
@@ -411,13 +411,21 @@ impl Shard {
                 break;
             }
 
-            let min_pid = self.dll.pop_tail().unwrap();
+            let node = self.dll.pop_tail().unwrap();
 
-            self.entries.remove(&min_pid.pid);
+            assert!(self.entries.remove(&node.pid));
 
-            to_evict.push(min_pid.pid);
+            to_evict.push(node.pid);
 
-            self.size -= min_pid.size();
+            self.size -= node.size();
+
+            // NB: node is stored in our entries map
+            // via a raw pointer, which points to
+            // the same allocation used in the DLL.
+            // We have to be careful to free node
+            // only after removing it from both
+            // the DLL and our entries map.
+            drop(node);
         }
 
         to_evict

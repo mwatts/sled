@@ -421,7 +421,7 @@ impl Serialize for Option<i64> {
 
 fn shift_i64_opt(value_opt: &Option<i64>) -> i64 {
     if let Some(value) = value_opt {
-        if value.signum() == -1 {
+        if *value < 0 {
             *value
         } else {
             value + 1
@@ -431,10 +431,10 @@ fn shift_i64_opt(value_opt: &Option<i64>) -> i64 {
     }
 }
 
-fn unshift_i64_opt(value: i64) -> Option<i64> {
+const fn unshift_i64_opt(value: i64) -> Option<i64> {
     if value == 0 {
         None
-    } else if value.signum() == -1 {
+    } else if value < 0 {
         Some(value)
     } else {
         Some(value - 1)
@@ -479,14 +479,15 @@ impl Serialize for Snapshot {
 
 impl Serialize for Node {
     fn serialized_size(&self) -> u64 {
-        (self.len as u64).serialized_size() + (self.len as u64)
+        let size = self.rss();
+        size.serialized_size() + size
     }
 
     fn serialize_into(&self, buf: &mut &mut [u8]) {
         assert!(self.overlay.is_empty());
-        (self.len as u64).serialize_into(buf);
-        buf[..self.len].copy_from_slice(self.as_ref());
-        scoot(buf, self.len);
+        self.rss().serialize_into(buf);
+        buf[..self.len()].copy_from_slice(self.as_ref());
+        scoot(buf, self.len());
     }
 
     fn deserialize(buf: &mut &[u8]) -> Result<Node> {
@@ -548,10 +549,13 @@ impl Serialize for PageState {
     fn serialized_size(&self) -> u64 {
         match self {
             PageState::Free(a, disk_ptr) => {
-                1 + a.serialized_size() + disk_ptr.serialized_size()
+                0_u64.serialized_size()
+                    + a.serialized_size()
+                    + disk_ptr.serialized_size()
             }
             PageState::Present { base, frags } => {
-                1 + base.serialized_size()
+                (1 + frags.len() as u64).serialized_size()
+                    + base.serialized_size()
                     + frags
                         .iter()
                         .map(|tuple| tuple.serialized_size())
@@ -564,16 +568,14 @@ impl Serialize for PageState {
     fn serialize_into(&self, buf: &mut &mut [u8]) {
         match self {
             PageState::Free(lsn, disk_ptr) => {
-                0_u8.serialize_into(buf);
+                0_u64.serialize_into(buf);
                 lsn.serialize_into(buf);
                 disk_ptr.serialize_into(buf);
             }
             PageState::Present { base, frags } => {
-                let frags_len: u8 = 1 + u8::try_from(frags.len())
-                    .expect("should never have more than 255 frags");
-                frags_len.serialize_into(buf);
+                (1 + frags.len() as u64).serialize_into(buf);
                 base.serialize_into(buf);
-                serialize_3tuple_ref_sequence(frags.iter(), buf);
+                serialize_2tuple_ref_sequence(frags.iter(), buf);
             }
             _ => panic!("tried to serialize {:?}", self),
         }
@@ -583,16 +585,15 @@ impl Serialize for PageState {
         if buf.is_empty() {
             return Err(Error::corruption(None));
         }
-        let discriminant = buf[0];
-        *buf = &buf[1..];
-        Ok(match discriminant {
+        let len = u64::deserialize(buf)?;
+        Ok(match len {
             0 => PageState::Free(
                 i64::deserialize(buf)?,
                 DiskPtr::deserialize(buf)?,
             ),
-            len => PageState::Present {
+            _ => PageState::Present {
                 base: Serialize::deserialize(buf)?,
-                frags: deserialize_bounded_sequence(buf, u64::from(len - 1))?,
+                frags: deserialize_bounded_sequence(buf, len - 1)?,
             },
         })
     }
@@ -648,17 +649,15 @@ where
     }
 }
 
-fn serialize_3tuple_ref_sequence<'a, XS, A, B, C>(xs: XS, buf: &mut &mut [u8])
+fn serialize_2tuple_ref_sequence<'a, XS, A, B>(xs: XS, buf: &mut &mut [u8])
 where
-    XS: Iterator<Item = &'a (A, B, C)>,
+    XS: Iterator<Item = &'a (A, B)>,
     A: Serialize + 'a,
     B: Serialize + 'a,
-    C: Serialize + 'a,
 {
     for item in xs {
         item.0.serialize_into(buf);
         item.1.serialize_into(buf);
-        item.2.serialize_into(buf);
     }
 }
 
@@ -787,10 +786,9 @@ mod qc {
                 // for the base fragment
                 let n = g.gen_range(0, 255);
 
-                let base = (g.gen(), DiskPtr::arbitrary(g), g.gen());
-                let frags = (0..n)
-                    .map(|_| (g.gen(), DiskPtr::arbitrary(g), g.gen()))
-                    .collect();
+                let base = (g.gen(), DiskPtr::arbitrary(g));
+                let frags =
+                    (0..n).map(|_| (g.gen(), DiskPtr::arbitrary(g))).collect();
                 PageState::Present { base, frags }
             } else {
                 PageState::Free(g.gen(), DiskPtr::arbitrary(g))

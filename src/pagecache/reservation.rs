@@ -21,7 +21,7 @@ impl<'a> Drop for Reservation<'a> {
         // We auto-abort if the user never uses a reservation.
         if !self.flushed {
             if let Err(e) = self.flush(false) {
-                self.log.config.set_global_error(e);
+                self.log.iobufs.set_global_error(e);
             }
         }
     }
@@ -52,11 +52,6 @@ impl<'a> Reservation<'a> {
     /// the log sequence number of the write, and the file offset.
     pub fn complete(mut self) -> Result<(Lsn, DiskPtr)> {
         self.flush(true)
-    }
-
-    /// Returns the length of the on-log reservation.
-    pub(crate) fn reservation_len(&self) -> usize {
-        self.buf.len()
     }
 
     /// Refills the reservation buffer with new data.
@@ -107,9 +102,27 @@ impl<'a> Reservation<'a> {
         self.flushed = true;
 
         if !valid {
-            // don't actually zero the message, still check its hash
-            // on recovery to find corruption.
             self.buf[4] = MessageKind::Canceled.into();
+
+            // zero the message contents to prevent UB
+            #[allow(unsafe_code)]
+            unsafe {
+                std::ptr::write_bytes(
+                    self.buf[self.header_len..].as_mut_ptr(),
+                    0,
+                    self.buf.len() - self.header_len,
+                )
+            }
+        }
+
+        // zero the crc bytes to prevent UB
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(
+                self.buf[..].as_mut_ptr(),
+                0,
+                std::mem::size_of::<u32>(),
+            )
         }
 
         let crc32 = calculate_message_crc32(

@@ -14,6 +14,8 @@ use std::marker::PhantomData;
 #[cfg(feature = "metrics")]
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
 
+use num_format::{Locale, ToFormattedString};
+
 use crate::Lazy;
 
 use super::*;
@@ -94,8 +96,13 @@ pub struct Metrics {
     pub accountant_next: Histogram,
     pub accountant_stabilize: Histogram,
     pub advance_snapshot: Histogram,
-    pub fuzzy_snapshot: Histogram,
     pub assign_offset: Histogram,
+    pub bytes_written_heap_item: CachePadded<AtomicUsize>,
+    pub bytes_written_heap_ptr: CachePadded<AtomicUsize>,
+    pub bytes_written_replace: CachePadded<AtomicUsize>,
+    pub bytes_written_link: CachePadded<AtomicUsize>,
+    pub bytes_written_other: CachePadded<AtomicUsize>,
+    pub fuzzy_snapshot: Histogram,
     pub compress: Histogram,
     pub decompress: Histogram,
     pub deserialize: Histogram,
@@ -283,12 +290,24 @@ impl Metrics {
         ));
         ret.push_str(&format!(
             "tree split success rates: child({}/{}) parent({}/{}) root({}/{})\n",
-            self.tree_child_split_success.load(Acquire),
-            self.tree_child_split_attempt.load(Acquire),
-            self.tree_parent_split_success.load(Acquire),
-            self.tree_parent_split_attempt.load(Acquire),
-            self.tree_root_split_success.load(Acquire),
-            self.tree_root_split_attempt.load(Acquire),
+            self.tree_child_split_success.load(Acquire)
+                    .to_formatted_string(&Locale::en)
+            ,
+            self.tree_child_split_attempt.load(Acquire)
+                    .to_formatted_string(&Locale::en)
+            ,
+            self.tree_parent_split_success.load(Acquire)
+                    .to_formatted_string(&Locale::en)
+            ,
+            self.tree_parent_split_attempt.load(Acquire)
+                    .to_formatted_string(&Locale::en)
+            ,
+            self.tree_root_split_success.load(Acquire)
+                    .to_formatted_string(&Locale::en)
+            ,
+            self.tree_root_split_attempt.load(Acquire)
+                    .to_formatted_string(&Locale::en)
+            ,
         ));
 
         ret.push_str(&format!(
@@ -305,7 +324,8 @@ impl Metrics {
             lat("pull", &self.pull),
             lat("page_out", &self.page_out),
         ]));
-        let hit_ratio = (self.get_page.count() - self.pull.count()) * 100
+        let hit_ratio = self.get_page.count().saturating_sub(self.pull.count())
+            * 100
             / (self.get_page.count() + 1);
         ret.push_str(&format!("hit ratio: {}%\n", hit_ratio));
 
@@ -342,12 +362,47 @@ impl Metrics {
         let log_reservation_attempts =
             std::cmp::max(1, self.log_reservation_attempts.load(Acquire));
         let log_reservation_retry_rate =
-            (log_reservation_attempts - log_reservations) * 100
+            log_reservation_attempts.saturating_sub(log_reservations) * 100
                 / (log_reservations + 1);
-        ret.push_str(&format!("log reservations: {}\n", log_reservations));
         ret.push_str(&format!(
-            "log res attempts: {}, ({}% retry rate)\n",
-            log_reservation_attempts, log_reservation_retry_rate,
+            "log reservations:             {:>15}\n",
+            log_reservations.to_formatted_string(&Locale::en)
+        ));
+        ret.push_str(&format!(
+            "log res attempts:             {:>15} ({}% retry rate)\n",
+            log_reservation_attempts.to_formatted_string(&Locale::en),
+            log_reservation_retry_rate,
+        ));
+
+        ret.push_str(&format!(
+            "heap item reserved bytes:     {:>15}\n",
+            self.bytes_written_heap_item
+                .load(Acquire)
+                .to_formatted_string(&Locale::en)
+        ));
+        ret.push_str(&format!(
+            "heap pointer reserved bytes:  {:>15}\n",
+            self.bytes_written_heap_ptr
+                .load(Acquire)
+                .to_formatted_string(&Locale::en)
+        ));
+        ret.push_str(&format!(
+            "node replace reserved bytes:  {:>15}\n",
+            self.bytes_written_replace
+                .load(Acquire)
+                .to_formatted_string(&Locale::en)
+        ));
+        ret.push_str(&format!(
+            "node link reserved bytes:     {:>15}\n",
+            self.bytes_written_link
+                .load(Acquire)
+                .to_formatted_string(&Locale::en)
+        ));
+        ret.push_str(&format!(
+            "other written reserved bytes: {:>15}\n",
+            self.bytes_written_other
+                .load(Acquire)
+                .to_formatted_string(&Locale::en)
         ));
 
         ret.push_str(&format!(
@@ -391,11 +446,15 @@ impl Metrics {
             ret.push_str("allocation statistics:\n");
             ret.push_str(&format!(
                 "total allocations: {}\n",
-                measure_allocs::ALLOCATIONS.load(Acquire)
+                measure_allocs::ALLOCATIONS
+                    .load(Acquire)
+                    .to_formatted_string(&Locale::en)
             ));
             ret.push_str(&format!(
                 "allocated bytes: {}\n",
-                measure_allocs::ALLOCATED_BYTES.load(Acquire)
+                measure_allocs::ALLOCATED_BYTES
+                    .load(Acquire)
+                    .to_formatted_string(&Locale::en)
             ));
         }
 

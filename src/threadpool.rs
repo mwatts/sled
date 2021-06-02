@@ -19,6 +19,7 @@ use crate::{OneShot, Result};
 ))]
 mod queue {
     use std::{
+        cell::RefCell,
         collections::VecDeque,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -30,6 +31,14 @@ mod queue {
     use parking_lot::{Condvar, Mutex};
 
     use crate::{debug_delay, Lazy, OneShot};
+
+    thread_local! {
+        static WORKER: RefCell<bool> = RefCell::new(false);
+    }
+
+    fn is_worker() -> bool {
+        WORKER.with(|w| *w.borrow())
+    }
 
     pub(super) static BLOCKING_QUEUE: Lazy<Queue, fn() -> Queue> =
         Lazy::new(Default::default);
@@ -76,7 +85,19 @@ mod queue {
             promise_filler.fill((work)());
         };
 
-        queue.send(Box::new(task));
+        if is_worker() {
+            // NB this could prevent deadlocks because
+            // if a threadpool thread spawns work into
+            // the threadpool's queue, which it later
+            // blocks on the completion of, it would be
+            // possible for threadpool threads to block
+            // forever on the completion of work that
+            // exists in the queue but will never be
+            // scheduled.
+            task();
+        } else {
+            queue.send(Box::new(task));
+        }
 
         promise
     }
@@ -126,6 +147,8 @@ mod queue {
         fn perform_work(&'static self, elastic: bool, temporary: bool) {
             const MAX_TEMPORARY_THREADS: usize = 16;
 
+            WORKER.with(|w| *w.borrow_mut() = true);
+
             self.spawning.store(false, Ordering::SeqCst);
 
             let wait_limit = Duration::from_millis(100);
@@ -141,6 +164,9 @@ mod queue {
                 let task_opt = self.recv_timeout(wait_limit);
 
                 if let Some((task, outstanding_work)) = task_opt {
+                    // execute the work sent to this thread
+                    (task)();
+
                     // spin up some help if we're falling behind
 
                     let temporary_threads =
@@ -172,9 +198,6 @@ mod queue {
                                 .fetch_sub(1, Ordering::SeqCst);
                         }
                     }
-
-                    // execute the work sent to this thread
-                    (task)();
 
                     unemployed_loops = 0;
                 } else {
@@ -238,11 +261,17 @@ pub fn truncate(config: crate::RunningConfig, at: u64) -> OneShot<Result<()>> {
     spawn_to(
         move || {
             log::debug!("truncating file to length {}", at);
-            config
+            let ret: Result<()> = config
                 .file
                 .set_len(at)
                 .and_then(|_| config.file.sync_all())
-                .map_err(|e| e.into())
+                .map_err(|e| e.into());
+
+            if let Err(e) = &ret {
+                config.set_global_error(e.clone());
+            }
+
+            ret
         },
         &queue::TRUNCATE_QUEUE,
     )
@@ -253,6 +282,7 @@ pub fn take_fuzzy_snapshot(pc: crate::pagecache::PageCache) -> OneShot<()> {
         move || {
             if let Err(e) = pc.take_fuzzy_snapshot() {
                 log::error!("failed to write snapshot: {:?}", e);
+                pc.log.iobufs.set_global_error(e);
             }
         },
         &queue::SNAPSHOT_QUEUE,
@@ -275,15 +305,7 @@ pub(crate) fn write_to_log(
 
                 // store error before notifying so that waiting threads will see
                 // it
-                iobufs.config.set_global_error(e);
-
-                let intervals = iobufs.intervals.lock();
-
-                // having held the mutex makes this linearized
-                // with the notify below.
-                drop(intervals);
-
-                let _notified = iobufs.interval_updated.notify_all();
+                iobufs.set_global_error(e);
             }
         },
         &queue::IO_QUEUE,

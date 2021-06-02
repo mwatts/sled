@@ -9,6 +9,8 @@
   which is enabled when compiling with the `metrics` feature.
 * #1254 `IVec` data will now always have an alignment of 8,
   which may enable interesting architecture-specific use cases.
+* #1307 & #1315 `Db::contains_tree` can be used to see if a
+  `Tree` with a given name already exists.
 
 ## Improvements
 
@@ -46,6 +48,10 @@
   platforms and 512mb on 32-bit platforms.
 * #1281 `Config`'s `cache_capacity` is now a usize, as u64
   doesn't make sense for things that must fit in memory anyway.
+* #1314 `Subscriber::next_timeout` now requires a mutable self
+  reference.
+* #1337 Bump MSRV to 1.48.
+
 
 ## Bug Fixes
 
